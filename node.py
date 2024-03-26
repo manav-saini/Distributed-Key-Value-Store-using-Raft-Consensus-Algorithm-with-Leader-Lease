@@ -40,6 +40,7 @@ class RaftNode:
         self.message_listener_thread.start()
         self.state_machine = {}
         self.lease_end_time = 0
+        self.old_leader_lease_expiry = 0
         self.log_file = f"logs_node_{self.node_id}/log.txt"
         self.metadata_file = f"logs_node_{self.node_id}/metadata.json"
         self.dump_file = f"logs_node_{self.node_id}/dump.txt"
@@ -158,13 +159,13 @@ class RaftNode:
             self.vote_count += 1
             if self.vote_count > len(self.cluster_nodes) / 2:
                 self.become_leader()
-                print(f"Became leader for term {self.term}")
 
     def become_leader(self):
         if self.state == NodeState.CANDIDATE:
             self.state = NodeState.LEADER
             self.leader_id = self.node_id
             print(f"Node {self.node_id} became the leader for term {self.term}.")
+            self.wait_for_old_leader_lease_expiry()
             self.log.append({'term': self.term, 'type': 'NO-OP'})
             self.update_lease_end_time()
             self.schedule_heartbeat()
@@ -172,6 +173,14 @@ class RaftNode:
             self.append_entries()
             heartbeat_reply_observer_thread = threading.Thread(target=self.observe_heartbeat_replies)
             heartbeat_reply_observer_thread.start()
+
+    def wait_for_old_leader_lease_expiry(self):
+        if self.old_leader_lease_expiry:
+            while time.time() < self.old_leader_lease_expiry + self.lease_end_time:
+                time.sleep(1)
+            print("Old leader's lease has expired. Continuing as the leader.")
+        else:
+            print("No old leader lease expiry information. Continuing as the leader.")
 
     def handle_append_replies(self, message):
         if message['success']:
@@ -216,6 +225,7 @@ class RaftNode:
             self.state = NodeState.FOLLOWER
             self.leader_id = message['leader_id']
             self.lease_end_time = message['lease_end_time']
+            self.old_leader_lease_expiry = message['lease_end_time']
             self.reset_election_timer()
             print(f"Received heartbeat from leader {self.leader_id}")
             self.update_lease_end_time()
@@ -232,7 +242,6 @@ class RaftNode:
             self.heartbeat_reply_lock.acquire()
             self.heartbeat_replies.add(message['node_id'])
             self.heartbeat_reply_lock.release()
-            print(f"Received ACK from node {message['node_id']} for term {self.term}")
 
     def observe_heartbeat_replies(self):
         while True:
@@ -359,7 +368,6 @@ class RaftNode:
 
     def observe_lease_timeout(self):
         while True:
-            print(f"Node {self.node_id} lease end time: {self.lease_end_time}")
             if self.state == NodeState.LEADER and not self.is_leader_lease_valid():
                 print(f"Leader {self.node_id} lease timed out. Stepping down to follower.")
                 self.state = NodeState.FOLLOWER
