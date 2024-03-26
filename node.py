@@ -47,6 +47,11 @@ class RaftNode:
         self.load_state_from_disk()
         signal.signal(signal.SIGINT, self.graceful_shutdown)
         signal.signal(signal.SIGTERM, self.graceful_shutdown)
+        lease_timeout_observer_thread = threading.Thread(target=self.observe_lease_timeout)
+        lease_timeout_observer_thread.start()
+        self.heartbeat_replies = set()
+        self.heartbeat_reply_lock = threading.Lock()
+        self.heartbeat_timeout = self.heartbeat_interval * 2
     def dump_file_state(self, message):
         with open(self.dump_file, "a") as df:
             df.write(json.dumps(message) + "\n")
@@ -165,6 +170,22 @@ class RaftNode:
             self.schedule_heartbeat()
             self.save_state_to_disk()
             self.append_entries()
+            heartbeat_reply_observer_thread = threading.Thread(target=self.observe_heartbeat_replies)
+            heartbeat_reply_observer_thread.start()
+
+    def handle_append_replies(self, message):
+        if message['success']:
+            self.apend_count += 1
+            self.append_nodes.append(message['node_id'])
+            if self.apend_count > len(self.cluster_nodes) / 2:
+                for node_id in self.append_nodes:
+                    if node_id not in self.append_done_nodes:
+                        self.match_index[node_id] = message['match_index']
+                        self.next_index[node_id] = message['match_index'] + 1
+                        self.append_done_nodes.append(node_id)
+                self.commit_index = message['match_index']
+                self.apply_to_state_machine(self.commit_index)
+                self.append_entries()
 
     
     def update_lease_end_time(self):
@@ -176,7 +197,6 @@ class RaftNode:
             threading.Timer(self.heartbeat_interval, self.schedule_heartbeat).start()
     
     def send_heartbeat_to_all_followers(self):
-        self.update_lease_end_time()
         for node_id in self.cluster_nodes:
             self.dump_file_state(f"Leader {self.node_id} sending heartbeat to {node_id}")
             if node_id != self.node_id:
@@ -198,6 +218,38 @@ class RaftNode:
             self.lease_end_time = message['lease_end_time']
             self.reset_election_timer()
             print(f"Received heartbeat from leader {self.leader_id}")
+            self.update_lease_end_time()
+            mssg = {
+                    'type': 'ack',
+                    'term': self.term,
+                    'node_id': self.node_id,
+                    'lease_end_time': self.lease_end_time
+                }
+            self.send_message(message["leader_id"], mssg)
+
+    def handle_ack(self, message):
+        if message['term'] == self.term:
+            self.heartbeat_reply_lock.acquire()
+            self.heartbeat_replies.add(message['node_id'])
+            self.heartbeat_reply_lock.release()
+            print(f"Received ACK from node {message['node_id']} for term {self.term}")
+
+    def observe_heartbeat_replies(self):
+        while True:
+            if self.state == NodeState.LEADER:
+                time.sleep(1)  # Check heartbeat replies every second
+                self.heartbeat_reply_lock.acquire()
+                if len(self.heartbeat_replies) > len(self.cluster_nodes) // 2:
+                    # Majority of followers have replied to the heartbeat
+                    self.update_lease_end_time()  # Reset the lease timer
+                    print("______________________________")
+                    print(f"Received majority heartbeat replies. Reset lease timer for leader {self.node_id}.")
+                    print("________________________________________")
+                self.heartbeat_replies.clear()  # Clear the heartbeat replies set
+                self.heartbeat_reply_lock.release()
+            else:
+                break  # If not leader, exit the thread
+            time.sleep(1) 
 
     def is_leader_lease_valid(self):
         return time.time() < self.lease_end_time
@@ -211,8 +263,13 @@ class RaftNode:
         print(f"Reset election timer for term {self.term}")
 
     def is_log_up_to_date(self, last_log_index, last_log_term):
-        # Implement log comparison logic here
-        return True  # Placeholder
+        try:
+            if len(self.log) > 0:
+                lastTerm = self.log[-1].term
+            logOk = (last_log_term > lastTerm) or (last_log_term == lastTerm and last_log_index >= len(self.log))
+            return logOk
+        except:
+            return True
 
     def append_entries(self):
         for node_id in self.cluster_nodes:
@@ -276,7 +333,7 @@ class RaftNode:
     
     def client_request_handler(self, request):
         if self.state == NodeState.LEADER:
-            if request['type'] == 'set':
+            if request['type'] == 'set'and self.is_leader_lease_valid():
                 entry = {'term': self.term, 'key': request['key'], 'value': request['value']}
                 self.log.append(entry)
                 self.append_entries()
@@ -299,11 +356,16 @@ class RaftNode:
                 self.state_machine[entry['key']] = entry['value']
             self.last_applied = i
         print(f"Node {self.node_id} applied entries up to index {upto_index} to state machine.")
-    
-    def serve_client(self):
-        # This method simulates the node serving client requests. It would be part of the server's main loop in a real application.
-        pass
 
+    def observe_lease_timeout(self):
+        while True:
+            print(f"Node {self.node_id} lease end time: {self.lease_end_time}")
+            if self.state == NodeState.LEADER and not self.is_leader_lease_valid():
+                print(f"Leader {self.node_id} lease timed out. Stepping down to follower.")
+                self.state = NodeState.FOLLOWER
+                self.leader_id = None
+            time.sleep(1)
+    
     def start(self):
         try:
             while True:
@@ -322,6 +384,8 @@ class RaftNode:
                 elif message['type'] == 'heartbeat':
                     print("Heartbeat")
                     self.handle_heartbeat(message)
+                elif message['type'] == 'ack':
+                    self.handle_ack(message)
         except KeyboardInterrupt:
             self.graceful_shutdown()
 
