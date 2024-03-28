@@ -41,6 +41,7 @@ class RaftNode:
         self.state_machine = {}
         self.lease_end_time = 0
         self.old_leader_lease_expiry = 0
+        self.append_count =0
         self.log_file = f"logs_node_{self.node_id}/log.txt"
         self.metadata_file = f"logs_node_{self.node_id}/metadata.json"
         self.dump_file = f"logs_node_{self.node_id}/dump.txt"
@@ -167,6 +168,8 @@ class RaftNode:
             print(f"Node {self.node_id} became the leader for term {self.term}.")
             self.wait_for_old_leader_lease_expiry()
             self.log.append({'term': self.term, 'type': 'NO-OP'})
+            self.next_index[self.node_id] = len(self.log)
+            self.match_index[self.node_id] = len(self.log) - 1
             self.update_lease_end_time()
             self.schedule_heartbeat()
             self.save_state_to_disk()
@@ -182,20 +185,38 @@ class RaftNode:
         else:
             print("No old leader lease expiry information. Continuing as the leader.")
 
+    # def handle_append_replies(self, message):
+    #     if message['success']:
+    #         self.apend_count += 1
+    #         self.append_nodes.append(message['node_id'])
+    #         if self.apend_count > len(self.cluster_nodes) / 2:
+    #             for node_id in self.append_nodes:
+    #                 if node_id not in self.append_done_nodes:
+    #                     self.match_index[node_id] = message['match_index']
+    #                     self.next_index[node_id] = message['match_index'] + 1
+    #                     self.append_done_nodes.append(node_id)
+    #             self.commit_index = message['match_index']
+    #             self.apply_to_state_machine(self.commit_index)
+    #             self.append_entries()
+
+
     def handle_append_replies(self, message):
         if message['success']:
-            self.apend_count += 1
-            self.append_nodes.append(message['node_id'])
-            if self.apend_count > len(self.cluster_nodes) / 2:
-                for node_id in self.append_nodes:
-                    if node_id not in self.append_done_nodes:
-                        self.match_index[node_id] = message['match_index']
-                        self.next_index[node_id] = message['match_index'] + 1
-                        self.append_done_nodes.append(node_id)
+            self.append_count += 1
+            if self.term==message['term'] and self.append_count > len(self.cluster_nodes) / 2:
                 self.commit_index = message['match_index']
-                self.apply_to_state_machine(self.commit_index)
-                self.append_entries()
-
+                for i in range( self.last_applied, self.commit_index + 1):
+                    try:
+                        self.state_machine[self.log[i]['key']] = self.log[i]['value']
+                    except:
+                        continue
+                for node_id in self.cluster_nodes:
+                    self.match_index[node_id] = message['match_index']
+                    self.next_index[node_id] = message['match_index'] + 1
+                    thread = threading.Thread(target=self.append_entries, args=("committed",))
+                    thread.start()
+                    thread.join()
+                self.last_applied = self.commit_index
     
     def update_lease_end_time(self):
         self.lease_end_time = time.time() + self.lease_duration
@@ -280,13 +301,14 @@ class RaftNode:
         except:
             return True
 
-    def append_entries(self):
+    def append_entries(self, state="uncommitted"):
         for node_id in self.cluster_nodes:
             if node_id != self.node_id:
                 entries = self.log[self.next_index[node_id]:]
                 message = {
                     'type': 'append_entries',
                     'term': self.term,
+                    'state': state,
                     'leader_id': self.node_id,
                     'prev_log_index': self.next_index[node_id] - 1,
                     'prev_log_term': self.log[self.next_index[node_id] - 1]['term'] if self.next_index[node_id] > 0 else 0,
@@ -299,39 +321,42 @@ class RaftNode:
         print(f"Appended entries: {entries}")
 
     def handle_append_entries(self, message):
-        response = {
-            'type': 'append_reply',
-            'term': self.term,
-            'success': False,
-            'match_index': -1
-        }
-        if message['term'] >= self.term:
-            self.term = message['term']
-            self.state = NodeState.FOLLOWER
-            self.leader_id = message['leader_id']
-            self.voted_for = None 
-            self.reset_election_timer()
-        if self.log_consistency_check(message['prev_log_index'], message['prev_log_term']):
-            self.next_index[message['leader_id']] = message['prev_log_index'] + len(message['entries']) + 1
-            self.match_index[message['leader_id']] = message['prev_log_index'] + len(message['entries'])
-            index = message['prev_log_index'] + 1
-            for entry in message['entries']:
-                if index < len(self.log):
-                    if self.log[index]['term'] != entry['term']:
-                        self.log = self.log[:index]
-                else:
-                    self.log.append(entry)
-                index += 1
+        if message["state"]=="uncommitted":
+            response = {
+                'type': 'append_reply',
+                'term': self.term,
+                'success': False,
+                'match_index': -1,
+                'index':-1
+            }
+            if message['term'] >= self.term:
+                self.term = message['term']
+                self.state = NodeState.FOLLOWER
+                self.leader_id = message['leader_id']
+                self.voted_for = None 
+                self.reset_election_timer()
+            if self.log_consistency_check(message['prev_log_index'], message['prev_log_term']):
+                self.next_index[message['leader_id']] = message['prev_log_index'] + len(message['entries']) + 1
+                self.match_index[message['leader_id']] = message['prev_log_index'] + len(message['entries'])
+                index = message['prev_log_index'] + 1
+                response['index'] = index
+                for entry in message['entries']:
+                    if index < len(self.log):
+                        if self.log[index]['term'] != entry['term']:
+                            self.log = self.log[:index]
+                    else:
+                        self.log.append(entry)
+                    index += 1
 
-            response['success'] = True
-            response['match_index'] = len(self.log) - 1
-        
-            if message['leader_commit'] > self.commit_index:
-                self.commit_index = min(message['leader_commit'], len(self.log) - 1)
-                self.apply_to_state_machine(self.commit_index)
+                response['success'] = True
+                response['match_index'] = len(self.log) - 1
+                if message['leader_commit'] > self.commit_index:
+                    self.commit_index = min(message['leader_commit'], len(self.log) - 1)
+            self.send_message(message['leader_id'], response)
+        else:
+            self.apply_to_state_machine(self.commit_index)
+            self.last_applied = self.commit_index
         self.save_state_to_disk()
-        self.send_message(message['leader_id'], response)
-        print(f"Handled append entries: {message}, sent reply: {response}")
 
     def log_consistency_check(self, prev_log_index, prev_log_term):
         if prev_log_index == -1:
@@ -341,10 +366,13 @@ class RaftNode:
         return False
     
     def client_request_handler(self, request):
+        print("INNNNNNN")
         if self.state == NodeState.LEADER:
             if request['type'] == 'set'and self.is_leader_lease_valid():
                 entry = {'term': self.term, 'key': request['key'], 'value': request['value']}
                 self.log.append(entry)
+                self.next_index[self.node_id] = len(self.log)
+                self.match_index[self.node_id] = len(self.log) - 1
                 self.append_entries()
                 return {"status": "success", "message": "Value set successfully"}
             elif request['type'] == 'get':
@@ -361,9 +389,11 @@ class RaftNode:
     def apply_to_state_machine(self, upto_index):
         for i in range(self.last_applied, upto_index + 1):
             entry = self.log[i]
-            if entry['type'] == 'set':
+            try:
                 self.state_machine[entry['key']] = entry['value']
-            self.last_applied = i
+                self.last_applied = i
+            except:
+                continue
         print(f"Node {self.node_id} applied entries up to index {upto_index} to state machine.")
 
     def observe_lease_timeout(self):
@@ -390,10 +420,11 @@ class RaftNode:
                     print("Vote Reply")
                     self.handle_vote_reply(message)
                 elif message['type'] == 'heartbeat':
-                    print("Heartbeat")
                     self.handle_heartbeat(message)
                 elif message['type'] == 'ack':
                     self.handle_ack(message)
+                elif message['type'] == 'append_reply':
+                    self.handle_append_replies(message)
         except KeyboardInterrupt:
             self.graceful_shutdown()
 
